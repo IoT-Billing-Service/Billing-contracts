@@ -213,6 +213,8 @@ mod stroop_fuzz_tests;
 #[cfg(test)]
 mod event_privacy_tests;
 #[cfg(test)]
+mod flow_rate_overflow_fuzz;
+#[cfg(test)]
 mod tariff_oracle_tests;
 #[cfg(test)]
 mod temporary_storage_tests;
@@ -310,6 +312,7 @@ pub mod secure_call_interface;
 pub mod tariff_oracle;
 pub mod event_privacy;
 pub mod temporary_storage;
+pub mod u256;
 pub mod velocity_limit;
 
 #[cfg(test)]
@@ -1029,6 +1032,9 @@ pub enum DataKey {
     DeviceNonce(BytesN<32>),
     NonceResetRequest(u64),
     AuthorizedNonceResetters,
+    // Issue #22 - Re-org replay protection
+    PastNonce(BytesN<32>, u64),
+    PendingTelemetryQueue(BytesN<32>),
     // Issue #20 - Privacy-preserving billing events
     TenantPrivacyConfig(Address),
     BillingCommitmentRecord(Address, u64),
@@ -1188,8 +1194,12 @@ pub enum ContractError {
     TimelockNotExpired = 109,
     RateOutOfBounds = 110,
     CircuitBreakerActive = 111,
+    // Issue #22 - Re-org replay protection
+    NonceAlreadyProcessed = 112,
+    TelemetryFromFutureLedger = 113,
+    TelemetryNotConfirmed = 114,
     // Issue #20 - Privacy-preserving billing events
-    TenantEventsDisabled = 112,
+    TenantEventsDisabled = 115,
 }
 
 #[contracttype]
