@@ -302,6 +302,7 @@ use gas_estimator::GasCostEstimator;
 pub mod enterprise;
 pub mod ghost_sweeper;
 pub mod grant_stream_listener;
+pub mod multi_sig_admin;
 pub mod nonce_sync;
 pub mod secure_call_interface;
 pub mod tariff_oracle;
@@ -1045,6 +1046,12 @@ pub enum DataKey {
     UpgradeApproval(u64, Address),
     UpgradeProposalCounter,
     ActiveUpgradeProposalId,
+    // Issue #24 - Multi-Sig Admin
+    AdminMofN,
+    AdminApproval(Symbol),
+    TimelockWD(u64),
+    WdCounter,
+    CbState,
 }
 
 #[contracterror(export = false)]
@@ -1171,6 +1178,10 @@ pub enum ContractError {
     UpgradeProposalExpired = 106,
     NotAuthorizedUpgradeSigner = 107,
     InsufficientUpgradeApprovals = 108,
+    // Issue #24 - Multi-Sig Admin
+    TimelockNotExpired = 109,
+    RateOutOfBounds = 110,
+    CircuitBreakerActive = 111,
 }
 
 #[contracttype]
@@ -1753,6 +1764,14 @@ fn get_admin_or_panic(env: &Env) -> Address {
 fn require_admin_auth(env: &Env) {
     let admin = get_admin_or_panic(env);
     admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 }
 
 /// Get or create dust aggregation for a specific token
@@ -3670,6 +3689,14 @@ impl UtilityContract {
         is_enabled: bool,
     ) {
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         // Validate limits are positive
         if global_limit <= 0 || per_stream_limit <= 0 {
@@ -3750,6 +3777,14 @@ impl UtilityContract {
         reason: Symbol,
     ) {
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         // Validate expiration time
         let current_time = env.ledger().timestamp();
@@ -3805,6 +3840,14 @@ impl UtilityContract {
     /// ```
     pub fn revoke_velocity_override(env: Env, admin: Address, meter_id: u64) {
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         // Check if override exists before attempting to revoke
         // This prevents unnecessary storage operations and provides better error messages
@@ -3869,6 +3912,14 @@ impl UtilityContract {
     /// ```
     pub fn add_sla_node(env: Env, admin: Address, node_pk: BytesN<32>) {
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         // Validate node public key format
         validate_ed25519_public_key(&node_pk)
@@ -3928,6 +3979,14 @@ impl UtilityContract {
     /// ```
     pub fn remove_sla_node(env: Env, admin: Address, node_pk: BytesN<32>) {
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         // Validate node public key format
         validate_ed25519_public_key(&node_pk)
@@ -6270,6 +6329,14 @@ impl UtilityContract {
             .expect("No admin set");
 
         current_admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, current_admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         // Check no active transfer
         let existing_proposal: Option<AdminTransferProposal> = env
@@ -6405,6 +6472,14 @@ impl UtilityContract {
         }
 
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
         env.storage().instance().set(&DataKey::CurrentAdmin, &admin);
 
         env.events()
@@ -6583,6 +6658,14 @@ impl UtilityContract {
             .expect("No admin set");
 
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         env.storage()
             .instance()
@@ -6657,6 +6740,14 @@ impl UtilityContract {
             .expect("No admin set");
 
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
 
         let mut verified_provider: VerifiedProvider = env
             .storage()
@@ -7866,6 +7957,14 @@ impl UtilityContract {
     pub fn set_platform_fee_bps(env: Env, fee_bps: i128) {
         let admin = get_admin_or_panic(&env);
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
         if fee_bps < 0 || fee_bps > MAX_PLATFORM_FEE_BPS {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
@@ -7880,6 +7979,14 @@ impl UtilityContract {
     pub fn set_protocol_fee_vault(env: Env, vault: Address) {
         let admin = get_admin_or_panic(&env);
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeVault, &vault);
@@ -7943,6 +8050,14 @@ impl UtilityContract {
     pub fn set_min_route_threshold(env: Env, threshold: i128) {
         let admin = get_admin_or_panic(&env);
         admin.require_auth();
+        // Issue #24: Require multi-sig approval for velocity limit changes
+        if multi_sig_admin::is_cb(&env) {
+            // Circuit breaker active — single admin auth suffices
+        } else if env.storage().instance().has(&DataKey::AdminMofN) {
+            if !multi_sig_admin::auth(&env, admin.clone(), symbol_short!("set_vl")) {
+                return;
+            }
+        }
         if threshold < 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
