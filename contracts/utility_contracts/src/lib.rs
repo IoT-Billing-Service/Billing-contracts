@@ -312,10 +312,13 @@ mod gas_estimator;
 use gas_estimator::GasCostEstimator;
 
 pub mod admin_validation;
+pub mod energy_grid;
 pub mod enterprise;
 pub mod ghost_sweeper;
 pub mod grant_stream_listener;
 pub mod multi_sig_admin;
+pub mod multi_sensor;
+pub mod namespace;
 pub mod nonce_sync;
 pub mod oracle_circuit_breaker;
 pub mod reentrancy_guard;
