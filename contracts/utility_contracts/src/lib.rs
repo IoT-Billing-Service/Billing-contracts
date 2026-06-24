@@ -211,6 +211,8 @@ mod streaming_invariant_tests;
 #[cfg(test)]
 mod stroop_fuzz_tests;
 #[cfg(test)]
+mod event_privacy_tests;
+#[cfg(test)]
 mod flow_rate_overflow_fuzz;
 #[cfg(test)]
 mod oracle_circuit_breaker_tests;
@@ -311,6 +313,7 @@ pub mod nonce_sync;
 pub mod oracle_circuit_breaker;
 pub mod secure_call_interface;
 pub mod tariff_oracle;
+pub mod event_privacy;
 pub mod temporary_storage;
 pub mod u256;
 pub mod velocity_limit;
