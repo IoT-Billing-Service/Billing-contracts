@@ -1,72 +1,68 @@
 #![no_std]
+use crate::namespace::{tenant_get, tenant_set, TenantSlot};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, token, Address, Env, String, Symbol, Vec, BytesN,
+    symbol_short, token, Address, BytesN, Env, Map, String, Symbol, Vec,
 };
 
-
-use soroban_sdk::{Env, Address, Symbol};
-use std::collections::HashMap;
-
+#[contracttype]
 #[derive(Clone)]
 pub struct MasterStream {
     pub account: Address,
-    pub sensors: HashMap<String, i128>, // MAC address → latest consumption payload
+    pub sensors: Map<String, i128>, // MAC address to latest consumption payload
     pub balance: i128,
 }
 
 pub fn add_sensor(env: &Env, account: Address, mac: String) {
-    let mut stream: MasterStream = env.storage().get(&format!("stream:{}", account))
-        .unwrap_or(MasterStream { account: account.clone(), sensors: HashMap::new(), balance: 0 });
+    account.require_auth();
+    let mut stream = load_or_default(env, &account);
 
-    stream.sensors.insert(mac.clone(), 0);
-    env.storage().set(&format!("stream:{}", account), &stream);
+    stream.sensors.set(mac.clone(), 0);
+    tenant_set(env, &account, TenantSlot::SensorStream, &stream);
 
-    env.events().publish(
-        (Symbol::short("SensorAdded"),),
-        (account, mac),
-    );
+    env.events()
+        .publish((symbol_short!("SensAdd"),), (account, mac));
 }
 
 pub fn remove_sensor(env: &Env, account: Address, mac: String) {
-    let mut stream: MasterStream = env.storage().get(&format!("stream:{}", account))
-        .unwrap_or_else(|| panic!("Stream not found"));
+    account.require_auth();
+    let mut stream = load_stream(env, &account);
 
-    stream.sensors.remove(&mac);
-    env.storage().set(&format!("stream:{}", account), &stream);
+    stream.sensors.remove(mac.clone());
+    tenant_set(env, &account, TenantSlot::SensorStream, &stream);
 
-    env.events().publish(
-        (Symbol::short("SensorRemoved"),),
-        (account, mac),
-    );
+    env.events()
+        .publish((symbol_short!("SensRem"),), (account, mac));
 }
 
 pub fn record_consumption(env: &Env, account: Address, mac: String, payload: i128) {
-    let mut stream: MasterStream = env.storage().get(&format!("stream:{}", account))
-        .unwrap_or_else(|| panic!("Stream not found"));
+    account.require_auth();
+    let mut stream = load_stream(env, &account);
 
-    if !stream.sensors.contains_key(&mac) {
+    if stream.sensors.get(mac.clone()).is_none() {
         panic!("Sensor not registered");
     }
 
-    stream.sensors.insert(mac.clone(), payload);
+    stream.sensors.set(mac.clone(), payload);
 
     // Aggregate total
-    let total: i128 = stream.sensors.values().sum();
+    let mut total = 0i128;
+    for (_sensor, value) in stream.sensors.iter() {
+        total = total.saturating_add(value);
+    }
 
     // Deduct from balance
-    stream.balance -= total;
-    env.storage().set(&format!("stream:{}", account), &stream);
+    stream.balance = stream.balance.saturating_sub(total);
+    tenant_set(env, &account, TenantSlot::SensorStream, &stream);
 
     env.events().publish(
-        (Symbol::short("AggregateUpdated"),),
+        (symbol_short!("AggUpdt"),),
         (account, total, stream.balance),
     );
 }
 
 pub fn validate_invariants(env: &Env, account: Address) {
-    let stream: MasterStream = env.storage().get(&format!("stream:{}", account))
-        .unwrap_or_else(|| panic!("Stream not found"));
+    let stream = load_stream(env, &account);
 
     if stream.balance < 0 {
         panic!("Balance invariant violated");
@@ -77,7 +73,17 @@ pub fn validate_invariants(env: &Env, account: Address) {
     }
 }
 
+fn load_or_default(env: &Env, account: &Address) -> MasterStream {
+    tenant_get(env, account, TenantSlot::SensorStream).unwrap_or_else(|| MasterStream {
+        account: account.clone(),
+        sensors: Map::new(env),
+        balance: 0,
+    })
+}
 
+fn load_stream(env: &Env, account: &Address) -> MasterStream {
+    tenant_get(env, account, TenantSlot::SensorStream).unwrap_or_else(|| panic!("Stream not found"))
+}
 
 // --- Grant Stream Listener Contract ---
 // This contract listens for GoalReached events from IoT-Billing-Service and processes grant matches

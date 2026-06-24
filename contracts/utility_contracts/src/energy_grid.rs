@@ -1,64 +1,78 @@
-use soroban_sdk::{Env, Address, Symbol};
+use crate::namespace::{tenant_get_or, tenant_set, TenantSlot};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, String};
 
-#[derive(Clone)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadConfig {
     pub peak_load_multiplier: i128,
     pub low_load_discount: i128,
-    pub active_window: String, // "peak" or "offpeak"
+    pub active_window: String,
 }
 
-pub fn set_peak_multiplier(env: &Env, admin: Address, multiplier: i128) {
-    // Only grid admin can configure
-    let stored_admin: Address = env.storage().get("grid_admin").unwrap();
+pub fn set_grid_admin(env: &Env, tenant: Address, admin: Address) {
+    tenant.require_auth();
+    tenant_set(env, &tenant, TenantSlot::GridAdmin, &admin);
+}
+
+pub fn set_peak_multiplier(env: &Env, tenant: Address, admin: Address, multiplier: i128) {
+    let stored_admin: Address = tenant_get_or(env, &tenant, TenantSlot::GridAdmin, tenant.clone());
     if admin != stored_admin {
         panic!("Unauthorized");
     }
-    env.storage().set("peak_load_multiplier", &multiplier);
+    admin.require_auth();
+
+    tenant_set(env, &tenant, TenantSlot::PeakLoadMultiplier, &multiplier);
     env.events().publish(
-        (Symbol::short("MultiplierActivated"),),
-        ("peak", multiplier),
+        (symbol_short!("MulAct"), tenant),
+        (symbol_short!("peak"), multiplier),
     );
 }
 
-pub fn set_low_discount(env: &Env, admin: Address, discount: i128) {
-    let stored_admin: Address = env.storage().get("grid_admin").unwrap();
+pub fn set_low_discount(env: &Env, tenant: Address, admin: Address, discount: i128) {
+    let stored_admin: Address = tenant_get_or(env, &tenant, TenantSlot::GridAdmin, tenant.clone());
     if admin != stored_admin {
         panic!("Unauthorized");
     }
-    env.storage().set("low_load_discount", &discount);
+    admin.require_auth();
+
+    tenant_set(env, &tenant, TenantSlot::LowLoadDiscount, &discount);
     env.events().publish(
-        (Symbol::short("MultiplierActivated"),),
-        ("offpeak", discount),
+        (symbol_short!("MulAct"), tenant),
+        (symbol_short!("offpeak"), discount),
     );
 }
 
-pub fn bill_consumption(env: &Env, user: Address, base_rate: i128, timestamp: u64) -> i128 {
-    // Determine active window based on time-of-use
+pub fn bill_consumption(
+    env: &Env,
+    tenant: Address,
+    user: Address,
+    base_rate: i128,
+    timestamp: u64,
+) -> i128 {
+    user.require_auth();
+
     let hour = (timestamp / 3600) % 24;
     let mut final_rate = base_rate;
 
-    if hour >= 18 && hour <= 22 {
-        // Peak hours
-        let peak: i128 = env.storage().get("peak_load_multiplier").unwrap_or(2);
+    if (18..=22).contains(&hour) {
+        let peak: i128 = tenant_get_or(env, &tenant, TenantSlot::PeakLoadMultiplier, 2);
         final_rate *= peak;
         env.events().publish(
-            (Symbol::short("BillingApplied"),),
-            (user.clone(), "peak", final_rate),
+            (symbol_short!("BillAppl"), tenant.clone()),
+            (user.clone(), symbol_short!("peak"), final_rate),
         );
     } else {
-        // Off-peak hours
-        let discount: i128 = env.storage().get("low_load_discount").unwrap_or(1);
-        final_rate = final_rate * discount / 100; // discount as percentage
+        let discount: i128 = tenant_get_or(env, &tenant, TenantSlot::LowLoadDiscount, 100);
+        final_rate = final_rate * discount / 100;
         env.events().publish(
-            (Symbol::short("BillingApplied"),),
-            (user.clone(), "offpeak", final_rate),
+            (symbol_short!("BillAppl"), tenant.clone()),
+            (user.clone(), symbol_short!("offpeak"), final_rate),
         );
     }
 
-    // Debit user balance
-    let mut balance: i128 = env.storage().get(&format!("balance:{}", user)).unwrap_or(0);
+    let mut balance: i128 = tenant_get_or(env, &tenant, TenantSlot::Balance(user.clone()), 0);
     balance -= final_rate;
-    env.storage().set(&format!("balance:{}", user), &balance);
+    tenant_set(env, &tenant, TenantSlot::Balance(user), &balance);
 
     final_rate
 }
