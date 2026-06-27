@@ -328,6 +328,7 @@ pub mod nonce_sync;
 pub mod oracle_circuit_breaker;
 pub mod reentrancy_guard;
 pub mod secure_call_interface;
+pub mod settlement_orchestrator;
 pub mod storage_ttl;
 pub mod remainder_accumulator;
 pub mod tariff_oracle;
@@ -1092,6 +1093,8 @@ pub enum DataKey {
     // Issue #19 — Telemetry billing (deterministic rollup + drift-aware cycle assignment)
     TelemetryEvents,
     TelemetryEventCounter,
+    // Issue — Two-phase commit settlement orchestrator
+    SettlementManager,
 }
 
 #[contracterror(export = false)]
@@ -8225,6 +8228,18 @@ impl UtilityContract {
         };
 
         routed_amount
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue — Settlement two-phase commit (recovery orchestrator)
+    // -----------------------------------------------------------------------
+
+    /// Trigger recovery scan: call the SettlementManager contract to resolve
+    /// timed-out journal entries.  Only callable by an authorised admin.
+    pub fn recovery_orchestrator(env: Env, manager: Address) -> (u64, u64) {
+        use crate::settlement_orchestrator::SettlementManagerClient;
+        let client = SettlementManagerClient::new(&env, &manager);
+        client.recovery_orchestrator()
     }
 }
 
