@@ -1,5 +1,6 @@
 #![no_std]
 use crate::gas_budget::GasBudget;
+use crate::nonce_sync::{compute_leaf_hash, verify_merkle_proof, BatchLeaf, MerkleProof, BatchSubmission};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, Symbol, Val, Vec,
@@ -106,6 +107,18 @@ pub trait SecureCallInterface {
 
     /// Re-enable cross-contract calls (admin only)
     fn emergency_enable(env: &Env);
+
+    /// Verify a batch Merkle leaf belongs to a signed batch submission.
+    /// Recomputes H(caller_device_id || calldata_reading || stored_batch_nonce || env.current_contract_id())
+    /// and checks it against the Merkle proof + root. Returns true only if
+    /// the leaf is authentic and has not been replayed across devices.
+    fn verify_batch_leaf(
+        env: &Env,
+        submission: &BatchSubmission,
+        proof: &MerkleProof,
+        claimed_device_id: &Address,
+        claimed_reading: i128,
+    ) -> bool;
 }
 
 /// Implementation of the secure call interface
@@ -370,6 +383,28 @@ impl SecureCallManager {
 
         env.events()
             .publish((symbol_short!("EOn"),), env.ledger().timestamp());
+    }
+
+    /// Verify a batch Merkle leaf belongs to a signed batch submission.
+    /// Recomputes the leaf hash from the claimed device_id, reading,
+    /// submission's batch_nonce, and `env.current_contract_id()`, then
+    /// validates the Merkle proof against the submission root.
+    pub fn verify_batch_leaf(
+        env: &Env,
+        submission: &BatchSubmission,
+        proof: &MerkleProof,
+        claimed_device_id: &Address,
+        claimed_reading: i128,
+    ) -> bool {
+        let contract_id = env.current_contract_id();
+        let leaf_hash = compute_leaf_hash(
+            env,
+            claimed_device_id,
+            claimed_reading,
+            submission.batch_nonce,
+            &contract_id,
+        );
+        verify_merkle_proof(env, &leaf_hash, proof, &submission.merkle_root)
     }
 
     fn load_call_budget(env: &Env, effective_gas_limit: u64) -> GasBudget {

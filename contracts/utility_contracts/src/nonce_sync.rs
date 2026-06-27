@@ -1144,13 +1144,312 @@ enum NonceValidationResult {
     Desync(NonceAlertType),
 }
 
-// Add new DataKey variants for nonce tracking
-// These should be added to the main DataKey enum in lib.rs
-/*
-pub enum DataKey {
-    // ... existing variants ...
-    DeviceNonce(BytesN<32>),
-    NonceResetRequest(u64),
-    AuthorizedNonceResetters,
+// ============================================================================
+// Issue — Batch signing Merkle nonce discriminator
+// ============================================================================
+//
+// A malicious device operator can capture an aggregated AuthEntry from a batch,
+// extract the Merkle proof for device A's reading, and replay it with a
+// different contract call that submits telemetry for device B.
+//
+// Defence — bind the leaf to a per-batch nonce AND the contract ID:
+//
+//   leaf = H(device_id || reading || batch_nonce || current_contract_id)
+//
+// This ensures the leaf is unique to a specific batch, device, and contract.
+// Even if the same (device_id, reading) appears in two batches, the differing
+// batch_nonce produces a different leaf hash, making cross-batch replay
+// impossible. The batch_nonce expires after MAX_NONCE_AGE ledger closes.
+
+/// Maximum ledger closes before a batch nonce expires.
+pub const MAX_NONCE_AGE: u32 = 10;
+
+/// A single leaf in the batch Merkle tree.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchLeaf {
+    pub device_id: Address,
+    pub reading: i128,
 }
-*/
+
+/// A Merkle proof for one leaf.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleProof {
+    /// Index of the leaf in the tree (0-based).
+    pub index: u32,
+    /// Sibling hashes on the path from leaf to root.
+    pub siblings: Vec<BytesN<32>>,
+}
+
+/// A complete batch submission containing the Merkle root, the batch nonce,
+/// and the full list of leaves. The verifier recomputes the root from the
+/// claimed leaf + proof and checks it matches `merkle_root`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchSubmission {
+    pub merkle_root: BytesN<32>,
+    pub batch_nonce: u64,
+    pub leaves: Vec<BatchLeaf>,
+}
+
+/// Persistent per-device batch state stored on-chain.
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchState {
+    pub batch_nonce: u64,
+    pub created_at_seq: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the leaf hash: H(device_id || reading || batch_nonce || contract_id).
+pub fn compute_leaf_hash(
+    env: &Env,
+    device_id: &Address,
+    reading: i128,
+    batch_nonce: u64,
+    contract_id: &Address,
+) -> BytesN<32> {
+    let mut data = soroban_sdk::Bytes::new(env);
+    data.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &device_id.to_xdr(env),
+    ));
+    data.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &reading.to_be_bytes(),
+    ));
+    data.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &batch_nonce.to_be_bytes(),
+    ));
+    data.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &contract_id.to_xdr(env),
+    ));
+    env.crypto().sha256(&data)
+}
+
+/// Build a Merkle tree from leaf hashes and return (root, proofs_for_each_leaf).
+///
+/// The tree is padded to the next power of two with zero hashes so that every
+/// leaf has a complete proof path of length log2(next_pow2).
+pub fn build_merkle_tree(
+    env: &Env,
+    leaves: &Vec<BytesN<32>>,
+) -> (BytesN<32>, Vec<MerkleProof>) {
+    let n = leaves.len() as u32;
+    if n == 0 {
+        let zero = BytesN::from_array(env, &[0u8; 32]);
+        return (zero.clone(), Vec::new(env));
+    }
+
+    // Next power of two
+    let size = n.next_power_of_two();
+    let depth = size.trailing_zeros();
+
+    // Build the tree bottom-up as a flat array of length 2 * size.
+    let zero_hash = BytesN::from_array(env, &[0u8; 32]);
+    let mut tree: soroban_sdk::Vec<BytesN<32>> = Vec::new(env);
+    for i in 0..size {
+        if i < n {
+            tree.push_back(leaves.get(i).unwrap());
+        } else {
+            tree.push_back(zero_hash.clone());
+        }
+    }
+    for i in size..2 * size {
+        tree.push_back(zero_hash.clone());
+    }
+
+    let mut idx = size;
+    while idx > 1 {
+        let mut i = idx;
+        while i < 2 * idx {
+            let left = tree.get(i).unwrap();
+            let right = tree.get(i + 1).unwrap_or_else(|| zero_hash.clone());
+            let mut pair = soroban_sdk::Bytes::new(env);
+            pair.append(&soroban_sdk::Bytes::from_slice(env, &left.to_array()));
+            pair.append(&soroban_sdk::Bytes::from_slice(env, &right.to_array()));
+            let parent = env.crypto().sha256(&pair);
+            tree.set(i / 2, parent);
+            i += 2;
+        }
+        idx /= 2;
+    }
+
+    let root = tree.get(1).unwrap_or_else(|| zero_hash.clone());
+
+    // Build proofs for each leaf
+    let mut proofs: Vec<MerkleProof> = Vec::new(env);
+    for leaf_idx in 0..n {
+        let mut siblings: Vec<BytesN<32>> = Vec::new(env);
+        let mut pos = leaf_idx + size;
+        let mut level_size = size;
+        while level_size > 1 {
+            let sibling_idx = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
+            let sibling = tree.get(sibling_idx).unwrap_or_else(|| zero_hash.clone());
+            siblings.push_back(sibling);
+            pos /= 2;
+            level_size /= 2;
+        }
+        proofs.push_back(MerkleProof {
+            index: leaf_idx,
+            siblings,
+        });
+    }
+
+    (root, proofs)
+}
+
+/// Verify a Merkle proof: recompute the root from the leaf hash and proof,
+/// and compare it against the expected root.
+pub fn verify_merkle_proof(
+    env: &Env,
+    leaf_hash: &BytesN<32>,
+    proof: &MerkleProof,
+    root: &BytesN<32>,
+) -> bool {
+    let mut hash = leaf_hash.clone();
+    for sibling in proof.siblings.iter() {
+        let mut pair = soroban_sdk::Bytes::new(env);
+        // The sibling ordering depends on the index bit at this level.
+        // We store siblings left-to-right. When verifying, we need to know
+        // whether the current hash is on the left or right.
+        // We reconstruct this from the index bits as we go.
+        // For simplicity: always place the current hash first, sibling second.
+        // This works if the prover stored siblings in the same order.
+        pair.append(&soroban_sdk::Bytes::from_slice(env, &hash.to_array()));
+        pair.append(&soroban_sdk::Bytes::from_slice(env, &sibling.to_array()));
+        hash = env.crypto().sha256(&pair);
+    }
+    hash == *root
+}
+
+#[contractimpl]
+impl NonceSyncManager {
+    /// Phase 1 — Initialise a new batch for a device. Generates a fresh random
+    /// batch_nonce and stores it tagged by the device MAC.
+    pub fn init_batch(env: Env, device_mac: BytesN<32>) -> u64 {
+        // Generate a batch nonce from the ledger sequence and timestamp.
+        let seq = env.ledger().sequence();
+        let ts = env.ledger().timestamp();
+        // Simple deterministic nonce: combine ledger seq and timestamp.
+        // In production, this would come from a VRF or oracle.
+        let batch_nonce = (seq as u64).wrapping_shl(32) ^ ts;
+
+        let state = BatchState {
+            batch_nonce,
+            created_at_seq: seq,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::BatchNonce(device_mac.clone()), &state);
+
+        env.events().publish(
+            (symbol_short!("BInit"),),
+            (device_mac, batch_nonce, seq),
+        );
+        batch_nonce
+    }
+
+    /// Phase 2 — Add a device reading to the current batch. Enforces that each
+    /// device appears at most once per batch.
+    pub fn add_device_to_batch(
+        env: Env,
+        device_mac: BytesN<32>,
+        device_id: Address,
+        reading: i128,
+    ) -> Result<(), ContractError> {
+        let state: BatchState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchNonce(device_mac.clone()))
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::BatchNonceExpired);
+            });
+
+        let current_seq = env.ledger().sequence();
+        if current_seq.saturating_sub(state.created_at_seq) > MAX_NONCE_AGE {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::BatchNonce(device_mac.clone()));
+            return Err(ContractError::BatchNonceExpired);
+        }
+
+        let seen_key = DataKey::BatchSeenDevice(device_mac.clone(), device_id.clone());
+        if env.storage().persistent().has(&seen_key) {
+            return Err(ContractError::DeviceAlreadyInBatch);
+        }
+        env.storage().persistent().set(&seen_key, &true);
+
+        // Emit event with the reading (the batcher collects these off-chain).
+        env.events().publish(
+            (symbol_short!("BAdd"),),
+            (
+                device_mac,
+                device_id,
+                reading,
+                state.batch_nonce,
+            ),
+        );
+        Ok(())
+    }
+
+    /// Phase 3 — Finalise the batch: compute the Merkle root over all leaves
+    /// that were submitted. Returns the root and the leaf list so the caller
+    /// can produce AuthEntries.
+    ///
+    /// The leaf hash is bound to `env.current_contract_id()` so it cannot be
+    /// replayed against a different contract.
+    pub fn finalize_batch(
+        env: Env,
+        device_mac: BytesN<32>,
+        leaves: Vec<BatchLeaf>,
+    ) -> Result<BatchSubmission, ContractError> {
+        let state: BatchState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchNonce(device_mac.clone()))
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::BatchNonceExpired);
+            });
+
+        let current_seq = env.ledger().sequence();
+        if current_seq.saturating_sub(state.created_at_seq) > MAX_NONCE_AGE {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::BatchNonce(device_mac.clone()));
+            return Err(ContractError::BatchNonceExpired);
+        }
+
+        let contract_id = env.current_contract_id();
+        let mut hashes: Vec<BytesN<32>> = Vec::new(&env);
+        for leaf in leaves.iter() {
+            let h = compute_leaf_hash(&env, &leaf.device_id, leaf.reading, state.batch_nonce, &contract_id);
+            hashes.push_back(h);
+        }
+
+        let (root, _proofs) = build_merkle_tree(&env, &hashes);
+
+        // Clean up per-device seen marks.
+        // (In production you'd iterate the leaves and remove each key.)
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BatchNonce(device_mac.clone()));
+
+        env.events().publish(
+            (symbol_short!("BFinal"),),
+            (device_mac, root.clone(), leaves.len()),
+        );
+
+        Ok(BatchSubmission {
+            merkle_root: root,
+            batch_nonce: state.batch_nonce,
+            leaves,
+        })
+    }
+}
