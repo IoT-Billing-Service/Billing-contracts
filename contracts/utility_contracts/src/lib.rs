@@ -1095,6 +1095,9 @@ pub enum DataKey {
     TelemetryEventCounter,
     // Issue — Two-phase commit settlement orchestrator
     SettlementManager,
+    // Issue — Batch signing Merkle nonce discriminator
+    BatchNonce(BytesN<32>),
+    BatchSeenDevice(BytesN<32>, Address),
 }
 
 #[contracterror(export = false)]
@@ -1232,6 +1235,11 @@ pub enum ContractError {
     // Issue #21 - Oracle staleness circuit breaker
     // (115 left for the in-flight privacy-events PR #29)
     OraclePriceUnavailable = 116,
+    // Issue — Batch signing Merkle nonce discriminator
+    BatchNonceExpired = 117,
+    DeviceAlreadyInBatch = 118,
+    InvalidMerkleProof = 119,
+    DeviceIdMismatch = 120,
 }
 
 #[contracttype]

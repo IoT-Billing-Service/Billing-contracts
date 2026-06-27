@@ -1,12 +1,13 @@
 extern crate std;
 
 use crate::nonce_sync::{
-    DeviceNonceState, NonceAlertType, NonceDesyncAlert, NonceResetRequest, NonceSyncManager,
+    build_merkle_tree, compute_leaf_hash, verify_merkle_proof, BatchLeaf, BatchState, DeviceNonceState,
+    NonceAlertType, NonceDesyncAlert, NonceResetRequest, NonceSyncManager, NonceSyncManagerClient,
     SignedHeartbeat, NONCE_WINDOW_SIZE,
 };
 use crate::{ContractError, DataKey};
 use soroban_sdk::{
-    testutils::Address as TestAddress, testutils::BytesN as TestBytesN, Address, BytesN, Env,
+    testutils::Address as TestAddress, testutils::BytesN as TestBytesN, Address, BytesN, Env, Vec,
 };
 use std::format;
 use std::string::String;
@@ -542,5 +543,218 @@ mod property_tests {
             let final_state = NonceSyncManager::get_device_nonce_state(env.clone(), device_mac.clone());
             prop_assert!(final_state.current_nonce >= max_nonce);
         }
+    }
+}
+
+/// Batch signing Merkle nonce discriminator tests.
+///
+/// Verifies that the leaf format H(device_id || reading || batch_nonce ||
+/// contract_id) prevents cross-device replay attacks within the same batch.
+#[cfg(test)]
+mod batch_signing_tests {
+    use super::*;
+    use crate::nonce_sync::MAX_NONCE_AGE;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Helper: generate a random 32-byte hash (mimics a device MAC).
+    fn random_mac(env: &Env) -> BytesN<32> {
+        TestBytesN::generate(env)
+    }
+
+    /// Helper: generate a random Address (mimics a device ID).
+    fn random_device(env: &Env) -> Address {
+        TestAddress::generate(env)
+    }
+
+    /// Register the NonceSyncManager and return a client for invoking through
+    /// the contract host (so env.current_contract_id() is valid).
+    fn setup_client(env: &Env) -> (NonceSyncManagerClient, Address) {
+        let contract_id = env.register_contract(None, NonceSyncManager);
+        let client = NonceSyncManagerClient::new(env, &contract_id);
+        (client, contract_id)
+    }
+
+    /// Basic sanity: init batch, add devices, finalize, verify each leaf.
+    #[test]
+    fn test_batch_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, contract_id) = setup_client(&env);
+        let device_mac = random_mac(&env);
+
+        // Phase 1: init batch
+        let batch_nonce = client.init_batch(&device_mac);
+        assert!(batch_nonce > 0);
+
+        // Phase 2: add 3 distinct devices
+        let d1 = random_device(&env);
+        let d2 = random_device(&env);
+        let d3 = random_device(&env);
+
+        assert!(client.add_device_to_batch(&device_mac, &d1, &1000).is_ok());
+        assert!(client.add_device_to_batch(&device_mac, &d2, &2000).is_ok());
+        assert!(client.add_device_to_batch(&device_mac, &d3, &3000).is_ok());
+
+        // Adding the same device again must fail.
+        let dup = client.add_device_to_batch(&device_mac, &d1, &9999);
+        assert_eq!(dup, Err(Ok(ContractError::DeviceAlreadyInBatch)));
+
+        // Phase 3: finalize
+        let leaves = soroban_sdk::vec![
+            &env,
+            BatchLeaf { device_id: d1.clone(), reading: 1000 },
+            BatchLeaf { device_id: d2.clone(), reading: 2000 },
+            BatchLeaf { device_id: d3.clone(), reading: 3000 },
+        ];
+        let submission = client.finalize_batch(&device_mac, &leaves).unwrap();
+
+        assert_eq!(submission.leaves.len(), 3);
+        assert!(submission.batch_nonce > 0);
+
+        // Build proofs and verify each leaf.
+        let mut hashes: Vec<BytesN<32>> = Vec::new(&env);
+        for leaf in submission.leaves.iter() {
+            let h = compute_leaf_hash(
+                &env,
+                &leaf.device_id,
+                leaf.reading,
+                submission.batch_nonce,
+                &contract_id,
+            );
+            hashes.push_back(h);
+        }
+        let (_root, proofs) = build_merkle_tree(&env, &hashes);
+        assert_eq!(proofs.len(), 3);
+
+        // Verify every leaf with its correct proof succeeds.
+        for i in 0..3 {
+            let proof = proofs.get(i).unwrap();
+            let ok = verify_merkle_proof(
+                &env,
+                &hashes.get(i).unwrap(),
+                &proof,
+                &submission.merkle_root,
+            );
+            assert!(ok, "leaf {i} should verify correctly");
+        }
+    }
+
+    /// Property test: generate a batch of up to 100 leaves, then attempt to
+    /// replay each leaf's proof against a DIFFERENT device_id. Every such
+    /// replay MUST fail — this is the core invariant.
+    #[test]
+    fn test_replay_with_wrong_device_id_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, contract_id) = setup_client(&env);
+        let device_mac = random_mac(&env);
+
+        // Init batch.
+        client.init_batch(&device_mac);
+
+        // Generate 100 distinct device IDs and readings.
+        let n: u32 = 100;
+        let mut devices: std::vec::Vec<Address> = std::vec::Vec::new();
+        let mut readings: std::vec::Vec<i128> = std::vec::Vec::new();
+        for _ in 0..n {
+            let d = random_device(&env);
+            let r = (env.ledger().timestamp() as i128) ^ 0xDEAD;
+            devices.push(d.clone());
+            readings.push(r);
+            let _ = client.add_device_to_batch(&device_mac, &d, &r);
+        }
+
+        // Build leaf list for finalization.
+        let mut leaves_sdk: Vec<BatchLeaf> = Vec::new(&env);
+        for i in 0..n as usize {
+            leaves_sdk.push_back(BatchLeaf {
+                device_id: devices[i].clone(),
+                reading: readings[i],
+            });
+        }
+        let submission = client.finalize_batch(&device_mac, &leaves_sdk).unwrap();
+
+        // Build Merkle proofs.
+        let mut hashes: Vec<BytesN<32>> = Vec::new(&env);
+        for leaf in submission.leaves.iter() {
+            let h = compute_leaf_hash(
+                &env,
+                &leaf.device_id,
+                leaf.reading,
+                submission.batch_nonce,
+                &contract_id,
+            );
+            hashes.push_back(h);
+        }
+        let (_root, proofs) = build_merkle_tree(&env, &hashes);
+
+        // Verify every leaf with its own proof first (sanity).
+        for i in 0..n as usize {
+            let proof = proofs.get(i as u32).unwrap();
+            let ok = verify_merkle_proof(
+                &env,
+                &hashes.get(i as u32).unwrap(),
+                &proof,
+                &submission.merkle_root,
+            );
+            assert!(ok, "self-verification of leaf {i} must pass");
+        }
+
+        // === CORE INVARIANT: replay with wrong device_id MUST fail. ===
+        for i in 0..n as usize {
+            let proof = proofs.get(i as u32).unwrap();
+            // Pick a different device_id (wrapping to 0 if at end).
+            let wrong_idx = if i + 1 < n as usize { i + 1 } else { 0 };
+            let wrong_device = &devices[wrong_idx];
+            let original_reading = readings[i];
+
+            // Compute the hash the VERIFIER would compute: uses the CALLER's
+            // claimed device_id (which is the wrong one) + the reading from
+            // the captured leaf. This is what the attacker supplies.
+            let replayed_hash = compute_leaf_hash(
+                &env,
+                wrong_device,
+                original_reading,
+                submission.batch_nonce,
+                &contract_id,
+            );
+
+            // The attacker's replayed hash differs from the original leaf hash
+            // because the device_id is wrong. Verification against the original
+            // proof MUST fail.
+            let replayed_ok = verify_merkle_proof(
+                &env,
+                &replayed_hash,
+                &proof,
+                &submission.merkle_root,
+            );
+            assert!(
+                !replayed_ok,
+                "replay of leaf {i} with wrong device_id must fail"
+            );
+        }
+    }
+
+    /// Test that a batch nonce expires after MAX_NONCE_AGE ledgers.
+    #[test]
+    fn test_batch_nonce_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _contract_id) = setup_client(&env);
+        let device_mac = random_mac(&env);
+        client.init_batch(&device_mac);
+
+        // Jump the ledger past the expiry threshold.
+        let far_seq = env.ledger().sequence() + MAX_NONCE_AGE + 1;
+        env.ledger().with_mut(|li| {
+            li.sequence_number = far_seq;
+        });
+
+        let device = random_device(&env);
+        let result = client.add_device_to_batch(&device_mac, &device, &500);
+        assert_eq!(result, Err(Ok(ContractError::BatchNonceExpired)));
     }
 }
