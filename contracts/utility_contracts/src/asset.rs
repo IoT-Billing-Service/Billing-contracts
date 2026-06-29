@@ -24,7 +24,11 @@
 //! (an inner `#![cfg(test)]` mid-file plus `ink!` macros with no `ink`
 //! dependency) and were never part of the module tree.
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, token, Env, Symbol};
+use crate::remainder_accumulator::validate_decimal_consistency;
+
+/// Storage key for token decimal precision
+const DECIMALS_KEY: Symbol = symbol_short!("decimals");
 
 /// Storage key holding the raw pool balance (the value the original spec read
 /// via `Symbol::new("pool_balance")`).
@@ -63,6 +67,28 @@ impl AssetManager {
         };
         env.storage().instance().set(&POOL_BALANCE, &initial_balance);
         env.storage().instance().set(&POOL_STATE, &state);
+    }
+
+    /// Set the decimal precision for a token
+    pub fn set_token_decimals(env: Env, token: Address, decimals: u32) {
+        env.storage().instance().set(&(DECIMALS_KEY, token), &decimals);
+    }
+
+    /// Get the decimal precision for a token (default to 18 if not set)
+    pub fn get_token_decimals(env: &Env, token: &Address) -> u32 {
+        env.storage().instance().get(&(DECIMALS_KEY, token.clone())).unwrap_or(18)
+    }
+
+    /// Transfer tokens with decimal validation
+    pub fn transfer(env: Env, token: Address, from: Address, to: Address, amount: u128) {
+        // Validate decimal consistency (if we have another token to compare, here we just check against default 18)
+        let token_decimals = Self::get_token_decimals(&env, &token);
+        // For now, validate against standard Soroban token decimals (18)
+        validate_decimal_consistency(token_decimals, 18);
+        
+        // Perform transfer
+        let client = token::Client::new(&env, &token);
+        client.transfer(&from, &to, &(amount as i128));
     }
 
     /// Public entry point. Delegates to [`AssetManager::rebalance_with_env`],

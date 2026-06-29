@@ -31,6 +31,98 @@
 
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map};
 
+// ---------------------------------------------------------------------------
+// Decimal trait and types for handling different precisions
+// ---------------------------------------------------------------------------
+
+/// Trait for types that represent a decimal value with fixed precision
+pub trait Decimal {
+    /// Number of decimal places (precision)
+    const DECIMALS: u32;
+    /// The raw value (scaled integer)
+    fn value(&self) -> u128;
+    /// Create a new decimal from a raw scaled value
+    fn from_raw(value: u128) -> Self;
+}
+
+/// 7-decimal price (SEP-40 compatible)
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Price7Dec {
+    pub raw: u128,
+}
+
+impl Decimal for Price7Dec {
+    const DECIMALS: u32 = 7;
+    fn value(&self) -> u128 {
+        self.raw
+    }
+    fn from_raw(value: u128) -> Self {
+        Self { raw: value }
+    }
+}
+
+/// 7-decimal usage (meter reading)
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Usage7Dec {
+    pub raw: u128,
+}
+
+impl Decimal for Usage7Dec {
+    const DECIMALS: u32 = 7;
+    fn value(&self) -> u128 {
+        self.raw
+    }
+    fn from_raw(value: u128) -> Self {
+        Self { raw: value }
+    }
+}
+
+/// 18-decimal token amount (Soroban compatible)
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Token18Dec {
+    pub raw: u128,
+}
+
+impl Decimal for Token18Dec {
+    const DECIMALS: u32 = 18;
+    fn value(&self) -> u128 {
+        self.raw
+    }
+    fn from_raw(value: u128) -> Self {
+        Self { raw: value }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calculate stream rate with proper decimal scaling to avoid precision loss
+// ---------------------------------------------------------------------------
+
+/// Calculate token amount (18 decimals) from price (7 decimals) and usage (7 decimals)
+/// Formula: (price * 10^11) * usage / 10^7 = price * usage * 10^4 (full 18 decimals)
+pub fn calculate_stream_rate(price: Price7Dec, usage: Usage7Dec) -> Token18Dec {
+    // Convert price from 7 decimals to 18 decimals (multiply by 10^11)
+    let price_18_dec = price.value().saturating_mul(10u128.pow(11));
+    // Multiply by usage (7 decimals) → total 25 decimals
+    let product = price_18_dec.saturating_mul(usage.value());
+    // Divide by 10^7 to get to 18 decimals
+    let token_amount = product / 10u128.pow(7);
+    Token18Dec::from_raw(token_amount)
+}
+
+// ---------------------------------------------------------------------------
+// Decimal consistency validation
+// ---------------------------------------------------------------------------
+
+/// Validate that two decimal precisions are compatible (mismatch ≤ 2 decimals)
+pub fn validate_decimal_consistency(decimals_a: u32, decimals_b: u32) {
+    let mismatch = if decimals_a > decimals_b {
+        decimals_a - decimals_b
+    } else {
+        decimals_b - decimals_a
+    };
+    assert!(mismatch <= 2, "Decimal precision mismatch too large: {} vs {}", decimals_a, decimals_b);
+}
+
 /// 7-decimal fixed-point scale.
 pub const PRECISION_FACTOR: u128 = 10_000_000; // 10^7
 
@@ -144,6 +236,7 @@ impl MeteredBilling {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // rate_denom = PRECISION_FACTOR means "reading" is already in 7-dp units.
     const RATE: u128 = 1;
@@ -225,5 +318,72 @@ mod tests {
         let exact = (reading * cycles) / PRECISION_FACTOR;
         assert_eq!(billed, exact);
         assert!(acc.reservoir < PRECISION_FACTOR, "residual dust must stay sub-unit");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Precision invariant tests for calculate_stream_rate
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_calculate_stream_rate_simple() {
+        // Price = 1.0 (7 decimals: 10_000_000)
+        let price = Price7Dec::from_raw(10_000_000);
+        // Usage = 1.0 (7 decimals: 10_000_000)
+        let usage = Usage7Dec::from_raw(10_000_000);
+        // Expected token amount: 1.0 (18 decimals: 1_000_000_000_000_000_000)
+        let expected = Token18Dec::from_raw(1_000_000_000_000_000_000);
+        let result = calculate_stream_rate(price, usage);
+        assert_eq!(result.value(), expected.value());
+    }
+
+    #[test]
+    fn test_calculate_stream_rate_small_values() {
+        // Price = 0.0000001 (7 decimals: 1)
+        let price = Price7Dec::from_raw(1);
+        // Usage = 0.0000001 (7 decimals: 1)
+        let usage = Usage7Dec::from_raw(1);
+        // Expected token amount: 0.00000000000001 (18 decimals: 10_000)
+        let expected = Token18Dec::from_raw(10_000);
+        let result = calculate_stream_rate(price, usage);
+        assert_eq!(result.value(), expected.value());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        /// Test that calculate_stream_rate has no precision loss beyond 10^-18
+        #[test]
+        fn prop_calculate_stream_rate_precision_invariant(
+            price_raw in 0u128..1_000_000_000_000_000_000u128,
+            usage_raw in 0u128..1_000_000_000_000_000_000u128
+        ) {
+            let price = Price7Dec::from_raw(price_raw);
+            let usage = Usage7Dec::from_raw(usage_raw);
+            let result = calculate_stream_rate(price, usage);
+            
+            // Calculate the exact value as a product, then check that the result
+            // is within 1 of the exact value (since we're using integer division)
+            let exact_product = price_raw.saturating_mul(usage_raw);
+            let expected_token_raw = exact_product.saturating_mul(10_000); // 10^(18-7-7) = 10^4
+            
+            // The result should be equal to expected (since integer division is exact here)
+            // Because we're multiplying first by 10^11 then dividing by 10^7 = multiply by 10^4
+            prop_assert_eq!(result.value(), expected_token_raw);
+        }
+    }
+
+    #[test]
+    fn test_validate_decimal_consistency() {
+        // Should pass (mismatch ≤ 2)
+        validate_decimal_consistency(18, 16);
+        validate_decimal_consistency(7, 9);
+        validate_decimal_consistency(18, 18);
+        
+        // Should panic (mismatch > 2)
+        let result = std::panic::catch_unwind(|| validate_decimal_consistency(18, 15));
+        assert!(result.is_err());
+        
+        let result = std::panic::catch_unwind(|| validate_decimal_consistency(7, 10));
+        assert!(result.is_err());
     }
 }
